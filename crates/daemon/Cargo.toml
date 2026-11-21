@@ -1,0 +1,20 @@
+[package]
+name = "spool-daemon"
+description = "Spool recorder daemon: drains the driver's ring buffer to audio files"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "spoold"
+path = "src/main.rs"
+
+[dependencies]
+spool-ring.workspace = true
+spool-proto.workspace = true
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+hound.workspace = true
+cpal.workspace = true
+rtrb.workspace = true

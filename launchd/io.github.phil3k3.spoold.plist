@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>io.github.phil3k3.spoold</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/local/bin/spoold</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ProcessType</key>
+	<string>Interactive</string>
+	<!-- scripts/install.sh sets StandardErrorPath to ~/Library/Logs/Spool/spoold.log
+	     (launchd does not expand ~). Never use /tmp: it is shared, and a symlink planted
+	     there would make launchd append to any file the user owns. -->
+</dict>
+</plist>

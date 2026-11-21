@@ -1,0 +1,15 @@
+[package]
+name = "spool-driver"
+description = "AudioServerPlugIn virtual output device that streams to the Spool recorder"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "spool_driver"
+# cdylib: loaded by coreaudiod as Spool.driver/Contents/MacOS/Spool. rlib: unit tests.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+spool-ring.workspace = true
+libc.workspace = true

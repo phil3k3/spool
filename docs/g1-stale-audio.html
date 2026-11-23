@@ -1,0 +1,342 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Loopback Stale Audio</title>
+<style>
+:root {
+  --bg: #f7f6f3; --surface: #ffffff; --ink: #1d1d1f; --muted: #6b6b70; --line: #d9d7d2;
+  --play: #3b6fd8; --play-soft: #d7e3fa;
+  --live: #2e9a5c; --silence: #c9c8c4; --stale: #d6453d; --left: #e0a020; --left-soft: #f7e4b5;
+  --code-bg: #f0efeb;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #161618; --surface: #1f1f22; --ink: #ececef; --muted: #9a9aa2; --line: #36363b;
+    --play: #6c95ee; --play-soft: #263a63;
+    --live: #4cc07f; --silence: #4a4a50; --stale: #f0645c; --left: #f0b840; --left-soft: #4d3d17;
+    --code-bg: #27272b;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #161618; --surface: #1f1f22; --ink: #ececef; --muted: #9a9aa2; --line: #36363b;
+  --play: #6c95ee; --play-soft: #263a63;
+  --live: #4cc07f; --silence: #4a4a50; --stale: #f0645c; --left: #f0b840; --left-soft: #4d3d17;
+  --code-bg: #27272b;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--ink);
+  font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+}
+main { max-width: 980px; margin: 0 auto; padding: 32px 16px 64px; }
+h1 { font-size: 1.75rem; margin: 0 0 6px; letter-spacing: -0.01em; }
+h2 { font-size: 1.15rem; margin: 40px 0 8px; }
+p { margin: 8px 0; }
+.lede { color: var(--muted); max-width: 70ch; }
+.card { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 18px; margin-top: 14px; }
+code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.88em; }
+code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
+pre { background: var(--code-bg); padding: 14px; border-radius: 8px; overflow-x: auto; line-height: 1.45; margin: 10px 0 0; }
+svg { display: block; width: 100%; height: auto; }
+svg text { fill: var(--ink); font-family: inherit; }
+svg .muted { fill: var(--muted); }
+.sim { display: grid; grid-template-columns: minmax(240px, 320px) 1fr; gap: 20px; align-items: start; }
+@media (max-width: 720px) { .sim { grid-template-columns: 1fr; } }
+.controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 12px; }
+button {
+  font: inherit; font-size: 0.9rem; padding: 6px 14px; border-radius: 8px; cursor: pointer;
+  border: 1px solid var(--line); background: var(--surface); color: var(--ink);
+}
+button:hover { border-color: var(--muted); }
+button.primary { background: var(--ink); color: var(--bg); border-color: var(--ink); }
+.toggle { display: inline-flex; align-items: center; gap: 6px; font-size: 0.9rem; margin-left: auto; cursor: pointer; }
+.phase { font-size: 0.95rem; min-height: 5.2em; }
+.phase b { display: block; margin-bottom: 2px; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 0.82rem; color: var(--muted); margin-top: 10px; }
+.legend span::before {
+  content: ""; display: inline-block; width: 11px; height: 11px; border-radius: 3px;
+  margin-right: 6px; vertical-align: -1px; background: var(--c);
+}
+.stat { font-variant-numeric: tabular-nums; font-size: 0.9rem; color: var(--muted); margin-top: 8px; }
+.stat b { color: var(--ink); }
+.steps { counter-reset: s; list-style: none; padding: 0; margin: 10px 0 0; }
+.steps li { counter-increment: s; position: relative; padding-left: 34px; margin: 10px 0; }
+.steps li::before {
+  content: counter(s); position: absolute; left: 0; top: 1px; width: 22px; height: 22px; border-radius: 50%;
+  background: var(--ink); color: var(--bg); font-size: 0.8rem; display: grid; place-items: center; font-weight: 600;
+}
+.note { font-size: 0.85rem; color: var(--muted); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Why the G1 loopback can replay old audio</h1>
+  <p class="lede">
+    <code>crates/driver/src/loopback.rs</code> clears each frame once it's read, so stale audio
+    shouldn't leak out. That only holds for frames somebody reads. Frames written while nobody
+    reads stay in the buffer, and a reader that joins later can hear them a full wrap later
+    (up to ~1.36 s at 48 kHz).
+  </p>
+
+  <h2>1 · The buffer is indexed by sample time</h2>
+  <div class="card">
+    <svg viewBox="0 0 900 190" role="img" aria-label="Output time leads input time; both map to the same slot via t modulo capacity">
+      <line x1="40" y1="60" x2="860" y2="60" stroke="var(--line)" stroke-width="2"/>
+      <text x="40" y="40" class="muted" font-size="13">device sample time →</text>
+      <line x1="450" y1="48" x2="450" y2="72" stroke="var(--ink)" stroke-width="2"/>
+      <text x="450" y="92" text-anchor="middle" font-size="13">now</text>
+      <rect x="250" y="50" width="120" height="20" rx="4" fill="var(--live)" opacity="0.85"/>
+      <text x="310" y="40" text-anchor="middle" font-size="13">ReadInput @ input time T</text>
+      <rect x="530" y="50" width="120" height="20" rx="4" fill="var(--play)" opacity="0.85"/>
+      <text x="590" y="40" text-anchor="middle" font-size="13">WriteMix @ output time T′</text>
+      <path d="M 590 74 C 590 130, 310 130, 310 74" fill="none" stroke="var(--muted)" stroke-dasharray="4 4"/>
+      <text x="450" y="128" text-anchor="middle" class="muted" font-size="12">~2 HAL buffers later, the reader reaches the time that was written</text>
+      <text x="450" y="168" text-anchor="middle" font-size="14">slot = T &amp; (65 536 − 1): the same T always lands in the same slot, one wrap apart</text>
+    </svg>
+    <p class="note">
+      The write for time <i>T</i> always happens before the read for <i>T</i>, so nothing needs to be synchronised.
+      The question is what's in the slot when the reader gets to a time that was <em>never written</em>.
+    </p>
+  </div>
+
+  <h2>2 · Step through it</h2>
+  <div class="card">
+    <div class="controls">
+      <button id="play" class="primary">Play</button>
+      <button id="step">Step</button>
+      <button id="reset">Reset</button>
+      <label class="toggle"><input type="checkbox" id="fix"> apply the fix (<code>written_until</code>)</label>
+    </div>
+    <div class="sim">
+      <div>
+        <svg id="ring" viewBox="0 0 320 320" role="img" aria-label="Loopback ring buffer"></svg>
+      </div>
+      <div>
+        <div class="phase" id="phase"></div>
+        <svg id="lanes" viewBox="0 0 960 190" role="img" aria-label="Timeline of what app A plays and app B hears"></svg>
+        <div class="stat" id="stat"></div>
+      </div>
+    </div>
+    <div class="legend">
+      <span style="--c: var(--play)">audio written, not read yet</span>
+      <span style="--c: var(--left)">left over: the reader already passed it, so it's never cleared</span>
+      <span style="--c: var(--live)">B hears the live mix</span>
+      <span style="--c: var(--silence)">B hears silence</span>
+      <span style="--c: var(--stale)">B hears audio replayed from one wrap ago</span>
+    </div>
+    <p class="note">Scaled down: 16 slots stand in for 65 536 frames, and one tick is one slot's worth of frames.
+      The reader trails the writer by 2 slots.</p>
+  </div>
+
+  <h2>3 · What happens, in order</h2>
+  <div class="card">
+    <ol class="steps">
+      <li><b>App A plays to Spool, and nobody reads the input.</b> <code>WriteMix</code> fills every slot.
+        Nothing is ever read, so nothing is cleared. That's fine as long as no one is listening.</li>
+      <li><b>App B opens Spool's input.</b> IO is already running (<code>io_clients</code> goes 1 → 2), so the
+        <code>clear_loopback()</code> in <code>start_io</code> doesn't run. B starts reading at the current input time.
+        The slots just behind it (amber) still hold audio nobody read.</li>
+      <li><b>App A stops.</b> With no client playing, there's nothing to write (assuming the HAL skips
+        <code>WriteMix</code> then, which is likely). B keeps reading past the last frame written.</li>
+      <li><b>B reaches the amber slots.</b> Each holds A's audio from exactly one wrap earlier. <code>read()</code>
+        returns it, so B hears that span again, then silence.</li>
+    </ol>
+    <p class="note">HAL overloads leave the same kind of hole on a smaller scale: a skipped cycle isn't written,
+      so its slot still holds the previous wrap. The ring tap fills such gaps with silence; the loopback doesn't.</p>
+  </div>
+
+  <h2>4 · The fix</h2>
+  <div class="card">
+    <p>Remember how far the output has been written, and return silence for any input time outside the
+      last capacity's worth of writes. BlackHole guards its input the same way, with its last output sample time.</p>
+<pre><code>pub struct Loopback {
+    channels: usize,
+    samples: Box&lt;[AtomicU32]&gt;,
+    written_until: AtomicU64, // f64 bits: end of the latest WriteMix
+}
+
+// write(t, samples): store frames as now, then
+self.written_until.store((t + frames as f64).to_bits(), Release);
+
+// read(t, out): per frame at time ft
+let end = f64::from_bits(self.written_until.load(Acquire));
+let fresh = ft &lt; end &amp;&amp; ft &gt;= end - CAPACITY_FRAMES as f64;
+let bits = slot.swap(0, Relaxed);          // still clear what we pass
+*v = if fresh { f32::from_bits(bits) } else { 0.0 };</code></pre>
+    <p>Optionally, <code>write_mix</code> can also zero a skipped span (as the ring's gap fill does), which
+      covers the overload case. A fake-host regression test: write, read nothing, stop writing, read one capacity
+      later, and expect silence.</p>
+  </div>
+</main>
+
+<script>
+(() => {
+  const CAP = 16, LAG = 2, A_STOP = 30, B_START = 22, END = 48;
+  const NS = "http://www.w3.org/2000/svg";
+  const ring = document.getElementById("ring");
+  const lanes = document.getElementById("lanes");
+  const phaseEl = document.getElementById("phase");
+  const statEl = document.getElementById("stat");
+  const fixEl = document.getElementById("fix");
+  const playBtn = document.getElementById("play");
+
+  let t, slots, written, heard, writtenUntil, lastRead, timer = null;
+
+  function reset() {
+    t = 0; slots = Array(CAP).fill(null); written = {}; heard = {};
+    writtenUntil = -Infinity; lastRead = null; render();
+  }
+
+  function tick() {
+    const fix = fixEl.checked;
+    lastRead = null;
+    // HAL order within a cycle: ReadInput, then WriteMix.
+    if (t >= B_START) {
+      const tin = t - LAG, i = ((tin % CAP) + CAP) % CAP, s = slots[i];
+      let kind, age = 0;
+      if (fix && (tin >= writtenUntil || tin < writtenUntil - CAP)) kind = "silence";
+      else if (s === null) kind = "silence";
+      else if (s === tin) kind = "live";
+      else { kind = "stale"; age = tin - s; }
+      slots[i] = null;
+      heard[tin] = { kind, age };
+      lastRead = { i, kind };
+    }
+    if (t < A_STOP) {
+      slots[t % CAP] = t; written[t] = true; writtenUntil = t + 1;
+    }
+    t++;
+  }
+
+  function el(name, attrs, parent, text) {
+    const e = document.createElementNS(NS, name);
+    for (const k in attrs) e.setAttribute(k, attrs[k]);
+    if (text !== undefined) e.textContent = text;
+    parent.appendChild(e);
+    return e;
+  }
+
+  function arc(cx, cy, r0, r1, a0, a1) {
+    const p = (r, a) => [cx + r * Math.cos(a), cy + r * Math.sin(a)];
+    const [x0, y0] = p(r1, a0), [x1, y1] = p(r1, a1), [x2, y2] = p(r0, a1), [x3, y3] = p(r0, a0);
+    return `M${x0} ${y0} A${r1} ${r1} 0 0 1 ${x1} ${y1} L${x2} ${y2} A${r0} ${r0} 0 0 0 ${x3} ${y3}Z`;
+  }
+
+  function renderRing() {
+    ring.innerHTML = "";
+    const cx = 160, cy = 160, r0 = 82, r1 = 128, step = (2 * Math.PI) / CAP, gap = 0.025;
+    const rp = t >= B_START ? t - LAG : null; // next input time to read
+    for (let i = 0; i < CAP; i++) {
+      const a0 = -Math.PI / 2 + i * step + gap, a1 = a0 + step - 2 * gap, am = (a0 + a1) / 2;
+      const s = slots[i];
+      let fill = "var(--surface)";
+      if (s !== null) fill = rp !== null && s < rp ? "var(--left)" : "var(--play)";
+      const flash = lastRead && lastRead.i === i;
+      el("path", {
+        d: arc(cx, cy, r0, r1, a0, a1), fill,
+        stroke: flash ? `var(--${lastRead.kind})` : "var(--line)",
+        "stroke-width": flash ? 4 : 1.2,
+      }, ring);
+      if (s !== null) {
+        el("text", { x: cx + 105 * Math.cos(am), y: cy + 105 * Math.sin(am) + 4, "text-anchor": "middle",
+          "font-size": 11, "font-weight": 600, fill: "#fff", style: "fill:#fff" }, ring, s);
+      }
+      el("text", { x: cx + 142 * Math.cos(am), y: cy + 142 * Math.sin(am) + 3.5, "text-anchor": "middle",
+        "font-size": 9, class: "muted" }, ring, i);
+    }
+    const head = (slot, label, color, dim) => {
+      const am = -Math.PI / 2 + (slot + 0.5) * step;
+      const x = cx + 68 * Math.cos(am), y = cy + 68 * Math.sin(am);
+      el("circle", { cx: x, cy: y, r: 10, fill: color, opacity: dim ? 0.3 : 1 }, ring);
+      el("text", { x, y: y + 4, "text-anchor": "middle", "font-size": 11, "font-weight": 700, style: "fill:#fff" }, ring, label);
+    };
+    if (t < A_STOP) head(t % CAP, "W", "var(--play)", false);
+    head((((t - LAG) % CAP) + CAP) % CAP, "R", "var(--live)", t < B_START);
+    el("text", { x: cx, y: cy - 8, "text-anchor": "middle", "font-size": 13, class: "muted" }, ring, "tick");
+    el("text", { x: cx, y: cy + 18, "text-anchor": "middle", "font-size": 26, "font-weight": 600 }, ring, t);
+  }
+
+  function renderLanes() {
+    lanes.innerHTML = "";
+    const X0 = 96, W = 17.5, cell = 15;
+    const x = k => X0 + k * W;
+    const yA = 34, yB = 128;
+    el("text", { x: 0, y: yA + 11, "font-size": 13, "font-weight": 600 }, lanes, "A plays");
+    el("text", { x: 0, y: yA + 27, "font-size": 11, class: "muted" }, lanes, "output time");
+    el("text", { x: 0, y: yB + 11, "font-size": 13, "font-weight": 600 }, lanes, "B hears");
+    el("text", { x: 0, y: yB + 27, "font-size": 11, class: "muted" }, lanes, "input time");
+    for (let k = 0; k < END; k++) {
+      el("rect", { x: x(k), y: yA, width: cell, height: cell, rx: 3,
+        fill: written[k] ? "var(--play)" : "none", stroke: "var(--line)" }, lanes);
+      const h = heard[k];
+      el("rect", { x: x(k), y: yB, width: cell, height: cell, rx: 3,
+        fill: h ? `var(--${h.kind})` : "none", stroke: "var(--line)" }, lanes);
+      if (k % 8 === 0) el("text", { x: x(k) + cell / 2, y: 182, "text-anchor": "middle", "font-size": 10, class: "muted" }, lanes, k);
+    }
+    // Replay links: B at time k heard what A wrote at k - age.
+    for (const k in heard) {
+      const h = heard[k];
+      if (h.kind !== "stale") continue;
+      const src = k - h.age;
+      el("path", { d: `M${x(+k) + cell / 2} ${yB} C ${x(+k) + cell / 2} ${yB - 45}, ${x(src) + cell / 2} ${yA + cell + 45}, ${x(src) + cell / 2} ${yA + cell}`,
+        fill: "none", stroke: "var(--stale)", "stroke-width": 1.2, opacity: 0.7 }, lanes);
+    }
+    // Event markers.
+    const mark = (k, label) => {
+      el("line", { x1: x(k) - 1.5, y1: 14, x2: x(k) - 1.5, y2: yB + cell + 4, stroke: "var(--muted)", "stroke-dasharray": "2 3" }, lanes);
+      el("text", { x: x(k) + 2, y: 12, "font-size": 11, class: "muted" }, lanes, label);
+    };
+    mark(B_START - LAG, "B joins");
+    mark(A_STOP, "A stops");
+    if (t > 0 && t <= END) {
+      el("line", { x1: x(t - 1) + cell / 2, y1: yA - 4, x2: x(t - 1) + cell / 2, y2: yA + cell + 4, stroke: "var(--ink)", "stroke-width": 2 }, lanes);
+    }
+  }
+
+  function renderText() {
+    const fix = fixEl.checked;
+    let title, body;
+    if (t < B_START) {
+      title = "Phase 1 · A plays, nobody reads";
+      body = "Every slot holds audio nobody consumes. After a wrap, new writes overwrite it, so nothing goes wrong yet.";
+    } else if (t < A_STOP) {
+      title = "Phase 2 · B opens Spool's input";
+      body = "IO is already running (io_clients 1 → 2), so start_io doesn't clear. The slots behind the reader turn amber: they will never be read or cleared.";
+    } else if (t < END) {
+      title = "Phase 3 · A stops, B keeps reading";
+      body = fix
+        ? "With the fix, any input time at or past written_until returns silence, so the amber slots stay unheard."
+        : "Nothing is written anymore. Past the last written frame, the reader reaches the amber slots and returns their contents: audio from one wrap ago.";
+    } else {
+      const n = Object.values(heard).filter(h => h.kind === "stale").length;
+      title = n ? `Done · B heard ${n} slots of replayed audio` : "Done · B heard no replayed audio";
+      body = n
+        ? `Input times ${A_STOP}–${A_STOP + n - 1} replayed what A played at ${A_STOP - CAP}–${A_STOP - CAP + n - 1}. In the real buffer, that's up to 65 536 frames (~1.36 s at 48 kHz). Turn on the fix and replay.`
+        : "Everything after A stopped is silence. That's the behaviour you want.";
+    }
+    phaseEl.innerHTML = `<b>${title}</b>${body}`;
+    const c = { live: 0, silence: 0, stale: 0 };
+    for (const k in heard) c[heard[k].kind]++;
+    statEl.innerHTML = `B heard <b>${c.live}</b> live · <b>${c.silence}</b> silent · <b style="color:var(--stale)">${c.stale}</b> replayed`;
+  }
+
+  function render() { renderRing(); renderLanes(); renderText(); }
+
+  function stop() { clearInterval(timer); timer = null; playBtn.textContent = "Play"; }
+  playBtn.onclick = () => {
+    if (timer) return stop();
+    if (t >= END) reset();
+    playBtn.textContent = "Pause";
+    timer = setInterval(() => { if (t >= END) return stop(); tick(); render(); }, 320);
+  };
+  document.getElementById("step").onclick = () => { stop(); if (t < END) { tick(); render(); } };
+  document.getElementById("reset").onclick = () => { stop(); reset(); };
+  fixEl.onchange = () => { stop(); reset(); };
+
+  reset();
+})();
+</script>
+</body>
+</html>

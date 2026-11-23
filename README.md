@@ -1,7 +1,8 @@
 # Spool
 
-A virtual macOS output device (like BlackHole) that records everything played to it
-straight to disk, and can forward it to your speakers. See [DESIGN.md](DESIGN.md) for goals
+A virtual macOS loopback device (like BlackHole) that records everything played to it
+straight to disk, can forward it to your speakers, and hands it to any app that records
+from Spool's input. See [DESIGN.md](DESIGN.md) for goals
 and roadmap and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how the components interact.
 
 ```
@@ -12,7 +13,7 @@ apps ─► coreaudiod ─► Spool.driver ──(POSIX shm ring)──► spool
 
 | Crate | What |
 |---|---|
-| `crates/driver` | AudioServerPlugIn (`cdylib`): one output device, f32 stream, volume and mute, 44.1–192 kHz |
+| `crates/driver` | AudioServerPlugIn (`cdylib`): one device with an output and a loopback input stream, f32, volume and mute, 44.1–192 kHz |
 | `crates/ring` | Lock-free SPSC ring in POSIX shared memory (the `coreaudiod` sandbox allows `ipc-posix-shm`) |
 | `crates/daemon` | `spoold`: drains the ring, writes 32-bit float WAV, rotates by size/duration, monitors to a real device |
 | `crates/proto` | JSON-over-Unix-socket control protocol |
@@ -59,6 +60,14 @@ volume and mute, so the volume keys work; recordings stay raw unless `--post-fad
 Sample-rate differences and clock drift are handled by a drift-correcting resampler;
 latency target is 50 ms (`spoold --monitor-latency-ms N`). Don't forward to an
 aggregate/multi-output device that contains Spool, which would feed back.
+
+**Loopback:** apps can also pick **Spool** as their *input* (a DAW track, OBS, Zoom,
+QuickTime). They receive what is played to Spool's output, sample-aligned on the device's
+own clock, with no `spoold` involved and nothing resampled. The input is pre-fader: volume
+and mute change what you hear, not what those apps get. The delay is the HAL's IO buffer
+on each side (about 5–6 ms at 128 frames, 48 kHz). Like any input device, reading it
+triggers the microphone permission prompt for that app. An app that records from Spool
+and plays back to Spool feeds back.
 
 `spoold` options: `--start [--device DEV]`, `--record`, `--max-minutes N`, `--max-mb N`
 (WAV is capped at ~4 GB), `--post-fader` (record after device volume and mute; default is

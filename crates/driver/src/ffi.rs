@@ -352,6 +352,7 @@ pub const kAudioStreamPropertyAvailableVirtualFormats: u32 = fcc(b"sfma");
 pub const kAudioStreamPropertyPhysicalFormat: u32 = fcc(b"pft ");
 pub const kAudioStreamPropertyAvailablePhysicalFormats: u32 = fcc(b"pfta");
 pub const kAudioStreamTerminalTypeSpeaker: u32 = fcc(b"spkr");
+pub const kAudioStreamTerminalTypeLine: u32 = fcc(b"line");
 
 // Controls
 pub const kAudioControlPropertyScope: u32 = fcc(b"cscp");
@@ -377,3 +378,4 @@ pub const kAudioChannelLabel_Discrete_0: u32 = 1 << 16;
 
 // IO operations
 pub const kAudioServerPlugInIOOperationWriteMix: u32 = fcc(b"rite");
+pub const kAudioServerPlugInIOOperationReadInput: u32 = fcc(b"read");

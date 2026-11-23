@@ -3,8 +3,42 @@
 
 use super::*;
 use spool_ring::Consumer;
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::sync::Mutex as StdMutex;
+use std::sync::atomic::AtomicUsize;
 use std::time::{Duration, Instant};
+
+/// Counts allocations made on a thread while it is "armed", to prove the IO path never
+/// allocates (DESIGN.md §5). Other threads, like the rate-change helper, are not counted.
+struct CountingAlloc;
+static RT_ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    static ARMED: Cell<bool> = const { Cell::new(false) };
+}
+unsafe impl GlobalAlloc for CountingAlloc {
+    unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+        if ARMED.with(Cell::get) {
+            RT_ALLOCATIONS.fetch_add(1, Relaxed);
+        }
+        unsafe { System.alloc(l) }
+    }
+    unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+        unsafe { System.dealloc(p, l) }
+    }
+}
+#[global_allocator]
+static ALLOC: CountingAlloc = CountingAlloc;
+
+/// Runs `f` and fails if it allocated on this thread.
+fn no_alloc<R>(what: &str, f: impl FnOnce() -> R) -> R {
+    let before = RT_ALLOCATIONS.load(Relaxed);
+    ARMED.with(|a| a.set(true));
+    let r = f();
+    ARMED.with(|a| a.set(false));
+    assert_eq!(RT_ALLOCATIONS.load(Relaxed), before, "{what} allocated on the IO path");
+    r
+}
 
 static NOTIFICATIONS: StdMutex<Vec<(AudioObjectID, u32)>> = StdMutex::new(Vec::new());
 
@@ -143,6 +177,25 @@ fn write_mix(samples: &mut [f32], sample_time: f64) -> OSStatus {
     }
 }
 
+fn do_io(op: u32, stream: AudioObjectID, buf: &mut [f32], output_time: f64, input_time: f64) -> OSStatus {
+    let frames = (buf.len() / CHANNELS as usize) as u32;
+    let mut cycle = AudioServerPlugInIOCycleInfo::default();
+    cycle.mOutputTime.mSampleTime = output_time;
+    cycle.mInputTime.mSampleTime = input_time;
+    unsafe {
+        (vt().DoIOOperation)(driver(), DEVICE_ID, stream, 1, op, frames, &cycle, buf.as_mut_ptr().cast(), std::ptr::null_mut())
+    }
+}
+
+/// ReadInput on the input stream at `t`, checked to be allocation-free. The buffer starts as
+/// NaN so a frame the driver failed to fill is caught.
+fn read_input(frames: usize, t: f64) -> Vec<f32> {
+    let mut buf = vec![f32::NAN; frames * CHANNELS as usize];
+    let st = no_alloc("ReadInput", || do_io(kAudioServerPlugInIOOperationReadInput, INPUT_STREAM_ID, &mut buf, 0.0, t));
+    assert_eq!(st, 0);
+    buf
+}
+
 fn read_all(c: &mut Consumer) -> Vec<f32> {
     let mut out = vec![0.0; 1 << 16];
     let mut all = Vec::new();
@@ -178,13 +231,53 @@ fn driver_behaves_like_a_hal_device() {
     assert_eq!(get_list::<u32>(PLUGIN_ID, glob(kAudioPlugInPropertyDeviceList)), vec![DEVICE_ID]);
     assert_eq!(get::<u32>(DEVICE_ID, glob(kAudioObjectPropertyClass)), kAudioDeviceClassID);
     assert_eq!(get::<u32>(DEVICE_ID, glob(kAudioObjectPropertyOwner)), PLUGIN_ID);
+    // Scope-correct children: global lists everything, each scope only its own objects.
+    let input = kAudioObjectPropertyScopeInput;
+    let output = kAudioObjectPropertyScopeOutput;
     assert_eq!(
         get_list::<u32>(DEVICE_ID, glob(kAudioObjectPropertyOwnedObjects)),
-        vec![STREAM_ID, VOLUME_ID, MUTE_ID]
+        vec![STREAM_ID, VOLUME_ID, MUTE_ID, INPUT_STREAM_ID]
     );
-    assert_eq!(get_list::<u32>(DEVICE_ID, addr(kAudioDevicePropertyStreams, kAudioObjectPropertyScopeInput)), vec![]);
-    assert_eq!(get_list::<u32>(DEVICE_ID, addr(kAudioDevicePropertyStreams, kAudioObjectPropertyScopeOutput)), vec![STREAM_ID]);
+    assert_eq!(get_list::<u32>(DEVICE_ID, addr(kAudioObjectPropertyOwnedObjects, input)), vec![INPUT_STREAM_ID]);
+    assert_eq!(get_list::<u32>(DEVICE_ID, addr(kAudioObjectPropertyOwnedObjects, output)), vec![STREAM_ID, VOLUME_ID, MUTE_ID]);
+    assert_eq!(get_list::<u32>(DEVICE_ID, glob(kAudioDevicePropertyStreams)), vec![STREAM_ID, INPUT_STREAM_ID]);
+    assert_eq!(get_list::<u32>(DEVICE_ID, addr(kAudioDevicePropertyStreams, input)), vec![INPUT_STREAM_ID]);
+    assert_eq!(get_list::<u32>(DEVICE_ID, addr(kAudioDevicePropertyStreams, output)), vec![STREAM_ID]);
+    for scope in [input, output] {
+        assert_eq!(get::<u32>(DEVICE_ID, addr(kAudioDevicePropertyDeviceCanBeDefaultDevice, scope)), 1);
+        assert_eq!(get::<u32>(DEVICE_ID, addr(kAudioDevicePropertyLatency, scope)), 0);
+        assert_eq!(get::<u32>(DEVICE_ID, addr(kAudioDevicePropertySafetyOffset, scope)), 0);
+    }
     assert_eq!(get::<u32>(STREAM_ID, glob(kAudioStreamPropertyDirection)), 0);
+    assert_eq!(get::<u32>(STREAM_ID, glob(kAudioStreamPropertyTerminalType)), kAudioStreamTerminalTypeSpeaker);
+
+    // Input stream: direction 1, line terminal, owned by the device, same format as the output.
+    assert_eq!(get::<u32>(INPUT_STREAM_ID, glob(kAudioObjectPropertyClass)), kAudioStreamClassID);
+    assert_eq!(get::<u32>(INPUT_STREAM_ID, glob(kAudioObjectPropertyOwner)), DEVICE_ID);
+    assert_eq!(get::<u32>(INPUT_STREAM_ID, glob(kAudioStreamPropertyDirection)), 1);
+    assert_eq!(get::<u32>(INPUT_STREAM_ID, glob(kAudioStreamPropertyTerminalType)), kAudioStreamTerminalTypeLine);
+    assert_eq!(get::<u32>(INPUT_STREAM_ID, glob(kAudioStreamPropertyStartingChannel)), 1);
+    assert_eq!(get::<u32>(INPUT_STREAM_ID, glob(kAudioStreamPropertyLatency)), 0);
+    for sel in [kAudioStreamPropertyVirtualFormat, kAudioStreamPropertyPhysicalFormat] {
+        assert_eq!(
+            get::<AudioStreamBasicDescription>(INPUT_STREAM_ID, glob(sel)),
+            get::<AudioStreamBasicDescription>(STREAM_ID, glob(sel))
+        );
+    }
+    assert_eq!(
+        get_list::<AudioStreamRangedDescription>(INPUT_STREAM_ID, glob(kAudioStreamPropertyAvailableVirtualFormats)).len(),
+        SAMPLE_RATES.len()
+    );
+    // IsActive is per stream.
+    assert_eq!(set(INPUT_STREAM_ID, glob(kAudioStreamPropertyIsActive), 0u32), 0);
+    assert_eq!(get::<u32>(INPUT_STREAM_ID, glob(kAudioStreamPropertyIsActive)), 0);
+    assert_eq!(get::<u32>(STREAM_ID, glob(kAudioStreamPropertyIsActive)), 1);
+    assert_eq!(set(INPUT_STREAM_ID, glob(kAudioStreamPropertyIsActive), 1u32), 0);
+    assert!(NOTIFICATIONS.lock().unwrap().contains(&(INPUT_STREAM_ID, kAudioStreamPropertyIsActive)));
+    // A format the device does not offer is refused on the input stream too.
+    let mut odd = get::<AudioStreamBasicDescription>(INPUT_STREAM_ID, glob(kAudioStreamPropertyVirtualFormat));
+    odd.mChannelsPerFrame = 7;
+    assert_eq!(set(INPUT_STREAM_ID, glob(kAudioStreamPropertyVirtualFormat), odd), kAudioDeviceUnsupportedFormatError);
     assert_eq!(get::<u32>(VOLUME_ID, glob(kAudioObjectPropertyClass)), kAudioVolumeControlClassID);
     assert_eq!(get::<u32>(VOLUME_ID, glob(kAudioObjectPropertyBaseClass)), kAudioLevelControlClassID);
     assert_eq!(get::<u32>(MUTE_ID, glob(kAudioObjectPropertyClass)), kAudioMuteControlClassID);
@@ -273,7 +366,9 @@ fn driver_behaves_like_a_hal_device() {
     let mut inplace = 0u8;
     unsafe { (vt().WillDoIOOperation)(d, DEVICE_ID, 1, kAudioServerPlugInIOOperationWriteMix, &mut will, &mut inplace) };
     assert_eq!(will, 1);
-    unsafe { (vt().WillDoIOOperation)(d, DEVICE_ID, 1, fcc(b"read"), &mut will, &mut inplace) };
+    unsafe { (vt().WillDoIOOperation)(d, DEVICE_ID, 1, kAudioServerPlugInIOOperationReadInput, &mut will, &mut inplace) };
+    assert_eq!((will, inplace), (1, 1));
+    unsafe { (vt().WillDoIOOperation)(d, DEVICE_ID, 1, fcc(b"mixo"), &mut will, &mut inplace) };
     assert_eq!(will, 0);
 
     assert_eq!(unsafe { (vt().StartIO)(d, DEVICE_ID, 1) }, 0);
@@ -288,6 +383,57 @@ fn driver_behaves_like_a_hal_device() {
         t += 512.0;
     }
     assert_eq!(read_all(&mut consumer), expected);
+
+    // Loopback: what was played at output time T comes out of the input at input time T,
+    // bit-exact, and neither operation allocates.
+    let base = 1000.0;
+    let frames = 512;
+    for cycle in 0..20 {
+        let got = read_input(frames, base + (cycle * frames) as f64);
+        let want = &expected[cycle * frames * 2..(cycle + 1) * frames * 2];
+        assert_eq!(got, want, "loopback cycle {cycle}");
+    }
+    // Zero-on-read: reading the same span again gives silence, not a repeat.
+    assert!(read_input(frames, base).iter().all(|&s| s == 0.0));
+    // Never written: silence.
+    assert!(read_input(256, 40_000.0).iter().all(|&s| s == 0.0));
+    // The output leads the input: several cycles in flight, buffer sizes the HAL may use.
+    let mut t2 = 20_000.0;
+    let mut sent = Vec::new();
+    for (i, n) in [32usize, 4096, 333, 128, 1].into_iter().enumerate() {
+        let mut block: Vec<f32> = (0..n * 2).map(|j| (i * 7919 + j) as f32 * 1e-6).collect();
+        sent.push((t2, block.clone()));
+        let st = no_alloc("WriteMix", || do_io(kAudioServerPlugInIOOperationWriteMix, STREAM_ID, &mut block, t2, 0.0));
+        assert_eq!(st, 0);
+        t2 += n as f64;
+    }
+    let _ = read_all(&mut consumer); // the ring tap got the same frames
+    for (t, block) in &sent {
+        assert_eq!(&read_input(block.len() / 2, *t), block, "frames at {t}");
+    }
+    // Pre-fader: volume and mute do not change what apps reading Spool receive.
+    assert_eq!(set(VOLUME_ID, glob(kAudioLevelControlPropertyScalarValue), 0.25f32), 0);
+    assert_eq!(set(MUTE_ID, glob(kAudioBooleanControlPropertyValue), 1u32), 0);
+    let mut block = vec![0.75f32; 64];
+    write_mix(&mut block, 30_000.0);
+    assert_eq!(read_input(32, 30_000.0), block);
+    assert_eq!(set(MUTE_ID, glob(kAudioBooleanControlPropertyValue), 0u32), 0);
+    assert_eq!(set(VOLUME_ID, glob(kAudioLevelControlPropertyScalarValue), 1.0f32), 0);
+    let _ = read_all(&mut consumer);
+    // Wrong stream for the operation: ignored, buffer untouched. Unknown stream: refused.
+    let mut buf = vec![5.0f32; 8];
+    assert_eq!(do_io(kAudioServerPlugInIOOperationReadInput, STREAM_ID, &mut buf, 0.0, 30_000.0), 0);
+    assert_eq!(do_io(kAudioServerPlugInIOOperationWriteMix, INPUT_STREAM_ID, &mut buf, 31_000.0, 0.0), 0);
+    assert!(buf.iter().all(|&s| s == 5.0));
+    assert!(read_input(4, 31_000.0).iter().all(|&s| s == 0.0));
+    assert_eq!(do_io(kAudioServerPlugInIOOperationReadInput, 99, &mut buf, 0.0, 0.0), kAudioHardwareBadObjectError);
+    // Null cycle info on ReadInput: silence instead of a guess.
+    let mut buf = vec![5.0f32; 8];
+    let st = unsafe {
+        (vt().DoIOOperation)(d, DEVICE_ID, INPUT_STREAM_ID, 1, kAudioServerPlugInIOOperationReadInput, 4, std::ptr::null(), buf.as_mut_ptr().cast(), std::ptr::null_mut())
+    };
+    assert_eq!(st, 0);
+    assert!(buf.iter().all(|&s| s == 0.0));
 
     // A skipped cycle is filled with silence so the recording keeps its timeline.
     let mut a1 = vec![1.0f32; 64];
@@ -317,6 +463,51 @@ fn driver_behaves_like_a_hal_device() {
     assert_eq!(s1, 2.0 * ZERO_TS_PERIOD as f64);
     assert!(h1 > anchor && h1 <= anchor + one_sec);
 
+    // A reader that joins while audio plays and keeps reading after it stops hears silence past
+    // the last write, not the unread frames from one wrap earlier (docs/g1-stale-audio.html).
+    // IO stays running throughout, so StartIO's clear doesn't help here.
+    let cap = loopback::CAPACITY_FRAMES as f64;
+    let first = 200_000.0;
+    let mut t = first;
+    while t < first + 2.0 * cap {
+        let mut block = vec![0.125f32; 1024];
+        let st = no_alloc("WriteMix", || do_io(kAudioServerPlugInIOOperationWriteMix, STREAM_ID, &mut block, t, 0.0));
+        assert_eq!(st, 0);
+        t += 512.0;
+    }
+    let _ = read_all(&mut consumer);
+    let last = t;
+    assert_eq!(read_input(512, last - 512.0), vec![0.125f32; 1024], "live before the writer stops");
+    let mut t = last;
+    while t < last + cap {
+        assert!(read_input(512, t).iter().all(|&s| s == 0.0), "replayed old audio at {t}");
+        t += 512.0;
+    }
+    // A skipped cycle (HAL overload) reads as silence too, and the gap fill doesn't allocate.
+    // First a full wrap nobody reads, so every slot holds old audio.
+    let mut t = last + cap;
+    let wrap_end = t + cap;
+    while t < wrap_end {
+        assert_eq!(write_mix(&mut vec![0.125f32; 1024], t), 0);
+        t += 512.0;
+    }
+    let mut block = vec![0.25f32; 1024];
+    assert_eq!(no_alloc("WriteMix", || do_io(kAudioServerPlugInIOOperationWriteMix, STREAM_ID, &mut block, wrap_end + 512.0, 0.0)), 0);
+    assert!(read_input(512, wrap_end).iter().all(|&s| s == 0.0), "skipped cycle replayed old audio");
+    assert_eq!(read_input(512, wrap_end + 512.0), vec![0.25f32; 1024]);
+    let _ = read_all(&mut consumer);
+
+    // Audio left in the loopback when IO stops does not come out after the next StartIO.
+    let mut block = vec![0.5f32; 64];
+    write_mix(&mut block, 50_000.0);
+    assert_eq!(unsafe { (vt().StopIO)(d, DEVICE_ID, 1) }, 0);
+    assert_eq!(unsafe { (vt().StartIO)(d, DEVICE_ID, 1) }, 0);
+    assert!(read_input(32, 50_000.0).iter().all(|&s| s == 0.0));
+    let _ = read_all(&mut consumer);
+    // Audio written before a rate change does not come out at the new rate.
+    write_mix(&mut block, 60_000.0);
+    let _ = read_all(&mut consumer);
+
     assert_eq!(unsafe { (vt().StopIO)(d, DEVICE_ID, 1) }, 0);
     assert!(!consumer.stats().running);
     assert_eq!(unsafe { (vt().StopIO)(d, DEVICE_ID, 1) }, kAudioHardwareIllegalOperationError);
@@ -330,6 +521,24 @@ fn driver_behaves_like_a_hal_device() {
         std::thread::sleep(Duration::from_millis(5));
     }
     assert_eq!(get::<AudioStreamBasicDescription>(STREAM_ID, glob(kAudioStreamPropertyPhysicalFormat)).mSampleRate, 96000.0);
+    assert_eq!(get::<AudioStreamBasicDescription>(INPUT_STREAM_ID, glob(kAudioStreamPropertyPhysicalFormat)).mSampleRate, 96000.0);
+    assert!(read_input(32, 60_000.0).iter().all(|&s| s == 0.0), "loopback cleared on rate change");
+    // A format set on the input stream changes the rate of both streams.
+    let f48 = get::<AudioStreamBasicDescription>(INPUT_STREAM_ID, glob(kAudioStreamPropertyVirtualFormat));
+    let want = AudioStreamBasicDescription { mSampleRate: 48000.0, ..f48 };
+    assert_eq!(set(INPUT_STREAM_ID, glob(kAudioStreamPropertyVirtualFormat), want), 0);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while get::<f64>(DEVICE_ID, glob(kAudioDevicePropertyNominalSampleRate)) != 48000.0 {
+        assert!(Instant::now() < deadline, "rate change from the input stream not performed");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(get::<AudioStreamBasicDescription>(STREAM_ID, glob(kAudioStreamPropertyVirtualFormat)).mSampleRate, 48000.0);
+    assert_eq!(set(DEVICE_ID, glob(kAudioDevicePropertyNominalSampleRate), 96000.0f64), 0);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while get::<f64>(DEVICE_ID, glob(kAudioDevicePropertyNominalSampleRate)) != 96000.0 {
+        assert!(Instant::now() < deadline, "rate change back not performed");
+        std::thread::sleep(Duration::from_millis(5));
+    }
     unsafe { (vt().StartIO)(d, DEVICE_ID, 1) };
     let mut block = vec![0.25f32; 32];
     write_mix(&mut block, 0.0);

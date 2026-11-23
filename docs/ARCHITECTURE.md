@@ -34,6 +34,7 @@ flowchart LR
     A1 -- audio --> HAL
     A2 -- audio --> HAL
     HAL -- "WriteMix (f32 mix)" --> DRV
+    DRV -- "ReadInput (loopback)" --> HAL
     DRV -- "write (RT-safe)" --> SHM
     SHM -- "read + heartbeat" --> D
     D -- "spool record" --> WAV
@@ -43,7 +44,7 @@ flowchart LR
 
 | Component | Crate | Runs as | Responsibility |
 |---|---|---|---|
-| Driver | `crates/driver` | `_coreaudiod`, inside the Core Audio host | Publishes the **Spool** output device. Copies the final mix into the ring. Nothing else. |
+| Driver | `crates/driver` | `_coreaudiod`, inside the Core Audio host | Publishes the **Spool** device. Copies the final mix into the ring and into the in-process loopback buffer, and serves that buffer to apps reading Spool's input. Nothing else. |
 | Ring | `crates/ring` | Library used by both sides | Lock-free single-producer single-consumer ring in POSIX shared memory. |
 | Daemon | `crates/daemon` (`spoold`) | User, launchd agent | Drains the ring, writes WAV files, forwards to a real device. |
 | Protocol | `crates/proto` | Library | Request/response types and socket client. |
@@ -97,11 +98,28 @@ flowchart TD
     St["Output stream — id 3<br/>f32, 2 ch, interleaved"]
     V["Volume control — id 4<br/>scalar 0..1, −96..0 dB"]
     M["Mute control — id 5"]
+    In["Input stream — id 6<br/>same format as id 3, line terminal<br/>loopback of the output"]
     P --> Dv
     Dv --> St
     Dv --> V
     Dv --> M
+    Dv --> In
 ```
+
+`OwnedObjects` and `Streams` on the device are scope-aware: the output scope lists 3, 4
+and 5, the input scope lists 6, and the global scope lists all of them. Both streams
+always share one format; a format change on either goes through
+`RequestDeviceConfigurationChange` and applies to both.
+
+Loopback (`crates/driver/src/loopback.rs`): a 65,536-frame buffer per device, allocated in
+`Initialize`, indexed by **sample time**. `WriteMix` stores the mix at the cycle's output
+time and `ReadInput` returns it at the same input time, clearing what it read. Only frames
+inside the last capacity's worth of writes (up to `written_until`) come out; anything else,
+including spans the HAL skipped, reads as silence. That keeps unread audio from one wrap
+earlier from coming out when a reader outlives the writer. The buffer is cleared when the first client starts IO and on every
+rate change. Samples are `AtomicU32` with relaxed ordering, which costs nothing over plain
+memory and stays sound if the HAL ever calls the two operations from different threads.
+The loopback is pre-fader.
 
 Driver lifecycle as the HAL drives it:
 
@@ -121,11 +139,16 @@ sequenceDiagram
     loop every IO cycle (real-time thread)
         HAL->>DRV: GetZeroTimeStamp
         HAL->>DRV: DoIOOperation(WriteMix, buffer)
+        DRV-->>DRV: loopback.write(output time, mix)
         alt consumer heartbeat fresh (< 2 s)
             DRV->>SHM: write_silence(gap) if HAL skipped cycles (< 0.5 s)
             DRV->>SHM: write(mix)
         else nobody listening
             DRV-->>DRV: skip, count in `skipped` (one atomic add)
+        end
+        opt an app reads Spool's input
+            HAL->>DRV: DoIOOperation(ReadInput, buffer)
+            DRV-->>HAL: loopback.read(input time), zero what was read
         end
     end
     HAL->>DRV: StopIO (last client: running = 0)

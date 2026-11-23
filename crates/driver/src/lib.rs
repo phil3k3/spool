@@ -1,15 +1,20 @@
-//! Spool AudioServerPlugIn: a virtual output device whose audio is streamed to the recorder
-//! daemon through a shared-memory ring.
+//! Spool AudioServerPlugIn: a virtual loopback device. What apps play to its output is
+//! streamed to the recorder daemon through a shared-memory ring, and comes back out of its
+//! input for any app that records from Spool.
 //!
 //! Object tree:
 //!
 //! ```text
 //! PlugIn (1)
-//! └── Device (2)              "Spool", output only
+//! └── Device (2)              "Spool", output and input
 //!     ├── Stream (3)          output, f32 interleaved
 //!     ├── Volume control (4)  output scope, master element
-//!     └── Mute control (5)    output scope, master element
+//!     ├── Mute control (5)    output scope, master element
+//!     └── Stream (6)          input, same format as stream 3 (loopback)
 //! ```
+//!
+//! The loopback is pre-fader: volume and mute change what you hear through the monitor, not
+//! what apps reading Spool's input receive (PRO.md §3.5).
 //!
 //! Threading model: the HAL calls property functions from arbitrary threads and IO functions
 //! from its real-time IO thread. All shared state is atomics; the only lock (`control`)
@@ -22,10 +27,12 @@
 #![allow(non_upper_case_globals)] // Core Audio constant names are kept verbatim.
 
 mod ffi;
+mod loopback;
 #[cfg(feature = "xpc-probe")]
 mod xpc_probe;
 
 use ffi::*;
+use loopback::Loopback;
 use spool_ring::{Format, Producer};
 use std::ffi::c_void;
 use std::panic::AssertUnwindSafe;
@@ -52,6 +59,7 @@ pub const DEVICE_ID: AudioObjectID = 2;
 pub const STREAM_ID: AudioObjectID = 3;
 pub const VOLUME_ID: AudioObjectID = 4;
 pub const MUTE_ID: AudioObjectID = 5;
+pub const INPUT_STREAM_ID: AudioObjectID = 6;
 
 fn ring_name() -> String {
     if cfg!(test) {
@@ -71,9 +79,12 @@ struct State {
     volume_scalar_bits: AtomicU32,
     muted: AtomicBool,
     stream_active: AtomicBool,
+    input_active: AtomicBool,
     io_clients: AtomicU32,
     control: Mutex<()>,
     ring: OnceLock<Producer>,
+    /// Output-to-input buffer, allocated in Initialize (never on the IO thread).
+    loopback: OnceLock<Loopback>,
     /// Latest requested sample rate (f64 bits, 0 = none) and whether a helper is running.
     pending_rate_bits: AtomicU64,
     rate_worker: AtomicBool,
@@ -91,9 +102,11 @@ static STATE: State = State {
     volume_scalar_bits: AtomicU32::new(1.0f32.to_bits()),
     muted: AtomicBool::new(false),
     stream_active: AtomicBool::new(true),
+    input_active: AtomicBool::new(true),
     io_clients: AtomicU32::new(0),
     control: Mutex::new(()),
     ring: OnceLock::new(),
+    loopback: OnceLock::new(),
     pending_rate_bits: AtomicU64::new(0),
     rate_worker: AtomicBool::new(false),
     anchor_host_time: AtomicU64::new(0),
@@ -101,6 +114,9 @@ static STATE: State = State {
 };
 
 impl State {
+    fn active_flag(&self, stream: AudioObjectID) -> &AtomicBool {
+        if stream == INPUT_STREAM_ID { &self.input_active } else { &self.stream_active }
+    }
     fn sample_rate(&self) -> f64 {
         f64::from_bits(self.sample_rate_bits.load(Relaxed))
     }
@@ -121,6 +137,15 @@ impl State {
                 let _ = self.ring.set(p);
             }
             Err(e) => log(&format!("Spool: cannot create shared-memory ring: {e}")),
+        }
+    }
+    /// Allocates the loopback buffer if needed. Not real-time safe.
+    fn ensure_loopback(&self) {
+        let _ = self.loopback.get_or_init(|| Loopback::new(CHANNELS));
+    }
+    fn clear_loopback(&self) {
+        if let Some(lb) = self.loopback.get() {
+            lb.clear();
         }
     }
     fn publish_gain(&self) {
@@ -318,10 +343,6 @@ fn channel_layout() -> Vec<u8> {
     v
 }
 
-fn is_input(scope: u32) -> bool {
-    scope == kAudioObjectPropertyScopeInput
-}
-
 /// Returns the value of a property, or an error if the object does not have it.
 /// `qualifier` is only used by kAudioPlugInPropertyTranslateUIDToDevice.
 fn get(obj: AudioObjectID, a: &AudioObjectPropertyAddress, qualifier: Option<CFStringRef>) -> Result<Val, OSStatus> {
@@ -356,8 +377,11 @@ fn get(obj: AudioObjectID, a: &AudioObjectPropertyAddress, qualifier: Option<CFS
             if let Some(v) = common(kAudioObjectClassID, kAudioDeviceClassID, PLUGIN_ID) {
                 return Ok(v);
             }
-            let owned: &[u32] = if is_input(a.mScope) { &[] } else { &[STREAM_ID, VOLUME_ID, MUTE_ID] };
-            let streams: &[u32] = if is_input(a.mScope) { &[] } else { &[STREAM_ID] };
+            let (owned, streams): (&[u32], &[u32]) = match a.mScope {
+                kAudioObjectPropertyScopeInput => (&[INPUT_STREAM_ID], &[INPUT_STREAM_ID]),
+                kAudioObjectPropertyScopeOutput => (&[STREAM_ID, VOLUME_ID, MUTE_ID], &[STREAM_ID]),
+                _ => (&[STREAM_ID, VOLUME_ID, MUTE_ID, INPUT_STREAM_ID], &[STREAM_ID, INPUT_STREAM_ID]),
+            };
             Ok(match a.mSelector {
                 kAudioObjectPropertyName => Val::string(DEVICE_NAME),
                 kAudioObjectPropertyManufacturer => Val::string(MANUFACTURER),
@@ -369,8 +393,9 @@ fn get(obj: AudioObjectID, a: &AudioObjectPropertyAddress, qualifier: Option<CFS
                 kAudioDevicePropertyClockDomain => Val::u32(0),
                 kAudioDevicePropertyDeviceIsAlive => Val::u32(1),
                 kAudioDevicePropertyDeviceIsRunning => Val::u32((s.io_clients.load(Relaxed) > 0) as u32),
-                kAudioDevicePropertyDeviceCanBeDefaultDevice => Val::u32(!is_input(a.mScope) as u32),
+                kAudioDevicePropertyDeviceCanBeDefaultDevice => Val::u32(1),
                 kAudioDevicePropertyDeviceCanBeDefaultSystemDevice => Val::u32(1),
+                // Both scopes: Spool adds nothing to the HAL's own buffering (PRO.md §3.4).
                 kAudioDevicePropertyLatency => Val::u32(0),
                 kAudioDevicePropertyStreams => Val::list(streams),
                 kAudioObjectPropertyControlList => Val::list(&[VOLUME_ID, MUTE_ID]),
@@ -395,15 +420,18 @@ fn get(obj: AudioObjectID, a: &AudioObjectPropertyAddress, qualifier: Option<CFS
                 _ => return unknown,
             })
         }
-        STREAM_ID => {
+        STREAM_ID | INPUT_STREAM_ID => {
             if let Some(v) = common(kAudioObjectClassID, kAudioStreamClassID, DEVICE_ID) {
                 return Ok(v);
             }
+            let input = obj == INPUT_STREAM_ID;
             Ok(match a.mSelector {
                 kAudioObjectPropertyOwnedObjects => Val::list::<u32>(&[]),
-                kAudioStreamPropertyIsActive => Val::u32(s.stream_active.load(Relaxed) as u32),
-                kAudioStreamPropertyDirection => Val::u32(0), // 0 = output
-                kAudioStreamPropertyTerminalType => Val::u32(kAudioStreamTerminalTypeSpeaker),
+                kAudioStreamPropertyIsActive => Val::u32(s.active_flag(obj).load(Relaxed) as u32),
+                kAudioStreamPropertyDirection => Val::u32(input as u32), // 0 = output, 1 = input
+                kAudioStreamPropertyTerminalType => {
+                    Val::u32(if input { kAudioStreamTerminalTypeLine } else { kAudioStreamTerminalTypeSpeaker })
+                }
                 kAudioStreamPropertyStartingChannel => Val::u32(1),
                 kAudioStreamPropertyLatency => Val::u32(0),
                 kAudioStreamPropertyVirtualFormat | kAudioStreamPropertyPhysicalFormat => {
@@ -454,9 +482,9 @@ fn settable(obj: AudioObjectID, sel: u32) -> bool {
     matches!(
         (obj, sel),
         (DEVICE_ID, kAudioDevicePropertyNominalSampleRate)
-            | (STREAM_ID, kAudioStreamPropertyIsActive)
-            | (STREAM_ID, kAudioStreamPropertyVirtualFormat)
-            | (STREAM_ID, kAudioStreamPropertyPhysicalFormat)
+            | (STREAM_ID | INPUT_STREAM_ID, kAudioStreamPropertyIsActive)
+            | (STREAM_ID | INPUT_STREAM_ID, kAudioStreamPropertyVirtualFormat)
+            | (STREAM_ID | INPUT_STREAM_ID, kAudioStreamPropertyPhysicalFormat)
             | (VOLUME_ID, kAudioLevelControlPropertyScalarValue)
             | (VOLUME_ID, kAudioLevelControlPropertyDecibelValue)
             | (MUTE_ID, kAudioBooleanControlPropertyValue)
@@ -494,12 +522,13 @@ fn set(obj: AudioObjectID, a: &AudioObjectPropertyAddress, data: *const c_void, 
     };
     match (obj, a.mSelector) {
         (DEVICE_ID, kAudioDevicePropertyNominalSampleRate) => change_rate(read_in::<f64>(data, size)?),
-        (STREAM_ID, kAudioStreamPropertyIsActive) => {
-            s.stream_active.store(read_in::<u32>(data, size)? != 0, Relaxed);
-            s.notify(STREAM_ID, &[kAudioStreamPropertyIsActive]);
+        (STREAM_ID | INPUT_STREAM_ID, kAudioStreamPropertyIsActive) => {
+            s.active_flag(obj).store(read_in::<u32>(data, size)? != 0, Relaxed);
+            s.notify(obj, &[kAudioStreamPropertyIsActive]);
             Ok(())
         }
-        (STREAM_ID, _) => {
+        // Both streams share one format, so a format set on either changes the device rate.
+        (STREAM_ID | INPUT_STREAM_ID, _) => {
             let f: AudioStreamBasicDescription = read_in(data, size)?;
             let want = asbd(f.mSampleRate);
             if f != want {
@@ -651,6 +680,7 @@ unsafe extern "C" fn initialize(d: AudioServerPlugInDriverRef, host: AudioServer
             let ticks_per_sec = spool_ring::ns_to_ticks(1_000_000_000) as f64;
             STATE.host_ticks_per_sec_bits.store(ticks_per_sec.to_bits(), Relaxed);
             STATE.ensure_ring();
+            STATE.ensure_loopback();
             #[cfg(feature = "xpc-probe")]
             if !cfg!(test) {
                 xpc_probe::spawn();
@@ -711,6 +741,8 @@ unsafe extern "C" fn perform_config_change(
             if let Some(r) = STATE.ring.get() {
                 r.set_format(STATE.format());
             }
+            // Frames stored at the old rate must not come out of the input at the new one.
+            STATE.clear_loopback();
             Ok(())
         }))
     })
@@ -858,6 +890,9 @@ unsafe extern "C" fn start_io(d: AudioServerPlugInDriverRef, dev: AudioObjectID,
             let _g = s.control.lock().unwrap_or_else(|e| e.into_inner());
             if s.io_clients.load(Relaxed) == 0 {
                 s.ensure_ring();
+                s.ensure_loopback();
+                // No IO is running, so nothing reads or writes the buffer concurrently.
+                s.clear_loopback();
                 s.anchor_host_time.store(spool_ring::host_ticks(), Relaxed);
                 s.next_sample_bits.store(f64::NAN.to_bits(), Relaxed);
                 if let Some(r) = s.ring.get() {
@@ -936,7 +971,7 @@ unsafe extern "C" fn will_do_io_operation(
         }
         // SAFETY: checked non-null.
         unsafe {
-            *will_do = (op == kAudioServerPlugInIOOperationWriteMix) as u8;
+            *will_do = matches!(op, kAudioServerPlugInIOOperationWriteMix | kAudioServerPlugInIOOperationReadInput) as u8;
             *in_place = 1;
         }
         kAudioHardwareNoError
@@ -965,7 +1000,12 @@ unsafe extern "C" fn end_io_operation(
     guard(kAudioHardwareUnspecifiedError, || status(check_device(d, dev)))
 }
 
-/// Real-time path. Copies the final mix into the shared ring; no allocation, locks or syscalls.
+/// Real-time path: no allocation, locks or syscalls.
+///
+/// - `WriteMix` on the output stream: copy the final mix into the shared ring (recording and
+///   monitoring) and into the loopback buffer at the cycle's output time.
+/// - `ReadInput` on the input stream: fill the HAL's buffer from the loopback buffer at the
+///   cycle's input time.
 unsafe extern "C" fn do_io_operation(
     d: AudioServerPlugInDriverRef,
     dev: AudioObjectID,
@@ -978,40 +1018,66 @@ unsafe extern "C" fn do_io_operation(
     _secondary: *mut c_void,
 ) -> OSStatus {
     guard(kAudioHardwareUnspecifiedError, || {
-        if check_device(d, dev).is_err() || stream != STREAM_ID {
+        if check_device(d, dev).is_err() || !matches!(stream, STREAM_ID | INPUT_STREAM_ID) {
             return kAudioHardwareBadObjectError;
         }
-        if op != kAudioServerPlugInIOOperationWriteMix || main.is_null() {
+        if main.is_null() {
             return kAudioHardwareNoError;
         }
-        let s = &STATE;
-        // SAFETY: the HAL provides `frames` frames of our virtual format (f32 × CHANNELS).
-        let samples = unsafe { std::slice::from_raw_parts(main as *const f32, frames as usize * CHANNELS as usize) };
         // SAFETY: the cycle info pointer is either null or valid for the call.
-        let sample_time = unsafe { cycle.as_ref() }.map(|c| c.mOutputTime.mSampleTime);
-        let expected = f64::from_bits(s.next_sample_bits.load(Relaxed));
-
-        if let Some(ring) = s.ring.get() {
-            if ring.consumer_alive() {
-                // Keep the recording's timeline intact across HAL overloads: fill skipped
-                // cycles (up to half a second) with silence.
-                if let Some(t) = sample_time {
-                    let gap = t - expected;
-                    if gap >= 1.0 && gap < s.sample_rate() * 0.5 {
-                        ring.write_silence(gap as usize * CHANNELS as usize);
-                    }
-                }
-                ring.write(samples);
-            } else {
-                // Lets a consumer whose heartbeat lapsed notice the hole (one atomic add).
-                ring.count_skipped(samples.len());
+        let cycle = unsafe { cycle.as_ref() };
+        let len = frames as usize * CHANNELS as usize;
+        match (op, stream) {
+            (kAudioServerPlugInIOOperationWriteMix, STREAM_ID) => {
+                // SAFETY: the HAL provides `frames` frames of our virtual format (f32 × CHANNELS).
+                let samples = unsafe { std::slice::from_raw_parts(main as *const f32, len) };
+                write_mix(samples, cycle.map(|c| c.mOutputTime.mSampleTime));
             }
-        }
-        if let Some(t) = sample_time {
-            s.next_sample_bits.store((t + frames as f64).to_bits(), Relaxed);
+            (kAudioServerPlugInIOOperationReadInput, INPUT_STREAM_ID) => {
+                // SAFETY: as above; the buffer is ours to fill for this operation.
+                let out = unsafe { std::slice::from_raw_parts_mut(main as *mut f32, len) };
+                read_input(out, cycle.map(|c| c.mInputTime.mSampleTime));
+            }
+            _ => {}
         }
         kAudioHardwareNoError
     })
+}
+
+fn read_input(out: &mut [f32], sample_time: Option<f64>) {
+    match (STATE.loopback.get(), sample_time) {
+        (Some(lb), Some(t)) => lb.read(t, out),
+        _ => out.fill(0.0),
+    }
+}
+
+fn write_mix(samples: &[f32], sample_time: Option<f64>) {
+    let s = &STATE;
+    if let (Some(lb), Some(t)) = (s.loopback.get(), sample_time) {
+        lb.write(t, samples);
+    }
+    let frames = samples.len() / CHANNELS as usize;
+    let expected = f64::from_bits(s.next_sample_bits.load(Relaxed));
+
+    if let Some(ring) = s.ring.get() {
+        if ring.consumer_alive() {
+            // Keep the recording's timeline intact across HAL overloads: fill skipped
+            // cycles (up to half a second) with silence.
+            if let Some(t) = sample_time {
+                let gap = t - expected;
+                if gap >= 1.0 && gap < s.sample_rate() * 0.5 {
+                    ring.write_silence(gap as usize * CHANNELS as usize);
+                }
+            }
+            ring.write(samples);
+        } else {
+            // Lets a consumer whose heartbeat lapsed notice the hole (one atomic add).
+            ring.count_skipped(samples.len());
+        }
+    }
+    if let Some(t) = sample_time {
+        s.next_sample_bits.store((t + frames as f64).to_bits(), Relaxed);
+    }
 }
 
 #[cfg(test)]

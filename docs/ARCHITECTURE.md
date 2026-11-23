@@ -398,7 +398,7 @@ flowchart LR
         BIN["/usr/local/bin/spoold, spool"]
     end
     subgraph usr["User"]
-        LA["~/Library/LaunchAgents/io.github.phil3k3.spoold.plist<br/>KeepAlive, log → ~/Library/Logs/Spool/spoold.log"]
+        LA["~/Library/LaunchAgents/&lt;prefix&gt;.spoold.plist<br/>KeepAlive, log → ~/Library/Logs/Spool/spoold.log"]
         SUP["~/Library/Application Support/Spool/<br/>spoold.sock (0600), last-device"]
         MUS["~/Music/Spool/"]
     end

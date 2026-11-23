@@ -10,6 +10,12 @@ name = "spool_driver"
 # cdylib: loaded by coreaudiod as Spool.driver/Contents/MacOS/Spool. rlib: unit tests.
 crate-type = ["cdylib", "rlib"]
 
+[features]
+# XPC transport spike (docs/XPC.md): probe the broker from a helper thread on Initialize.
+# Off by default; `scripts/install.sh --xpc` builds with it.
+xpc-probe = ["dep:spool-mach"]
+
 [dependencies]
 spool-ring.workspace = true
 libc.workspace = true
+spool-mach = { workspace = true, optional = true }

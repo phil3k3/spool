@@ -1,0 +1,14 @@
+[package]
+name = "spool-broker"
+description = "Spool XPC broker (spike): receives the driver's memory entry and hands it to clients"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "spool-broker"
+path = "src/main.rs"
+
+[dependencies]
+spool-mach.workspace = true
+libc.workspace = true

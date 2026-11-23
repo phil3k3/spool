@@ -77,6 +77,13 @@ target/release/spool --socket /tmp/spool-try.sock status     # from another term
 The separate `--socket` matters if Spool is installed: only one `spoold` may run per socket,
 so a second one on the default socket exits with "another spoold is already running".
 
+## Identifiers
+
+The driver's bundle ID and the launchd names use a reverse-DNS prefix derived at build
+time from the `origin` remote (`github.com/<owner>/…` → `io.github.<owner>`), so forks
+don't clash with upstream. Override it with `SPOOL_ID_PREFIX=com.example`, and check it
+with `scripts/spool-id.sh`. Details are in [docs/XPC.md](docs/XPC.md) §5.
+
 ## Behaviour notes
 
 - When no app is playing, Core Audio stops IO and nothing is written. The file resumes
@@ -91,7 +98,9 @@ so a second one on the default socket exits with "another spoold is already runn
 - The shared-memory ring is mode 0666 because `coreaudiod` and `spoold` run as different
   users, and macOS cannot change a shm object's mode or owner after creation. **Any local
   user or process can therefore read (and write) the audio played to Spool.** Don't use
-  it for sensitive audio on a shared Mac. The driver never writes into a ring it does
+  it for sensitive audio on a shared Mac. An opt-in XPC transport that closes this is in progress
+  ([docs/XPC.md](docs/XPC.md)); `scripts/install.sh --xpc` installs its spike, which does
+  not carry audio yet. The driver never writes into a ring it does
   not own, `spoold` only attaches to one owned by `_coreaudiod` or by you (the test
   tone), everything read from the ring is validated, and only one consumer can be
   attached at a time.

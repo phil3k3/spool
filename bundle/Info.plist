@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Template: scripts/build-bundle.sh replaces @SPOOL_ID@ with scripts/spool-id.sh's prefix. -->
 <plist version="1.0">
 <dict>
 	<key>CFBundleDevelopmentRegion</key>
@@ -7,7 +8,7 @@
 	<key>CFBundleExecutable</key>
 	<string>Spool</string>
 	<key>CFBundleIdentifier</key>
-	<string>io.github.phil3k3.spool.driver</string>
+	<string>@SPOOL_ID@.spool.driver</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
@@ -24,6 +25,12 @@
 	</array>
 	<key>LSMinimumSystemVersion</key>
 	<string>13.0</string>
+	<!-- Mach services the plug-in may look up from the Core Audio sandbox. Always declared:
+	     it does nothing unless the XPC broker LaunchDaemon is installed (docs/XPC.md). -->
+	<key>AudioServerPlugIn_MachServices</key>
+	<array>
+		<string>@SPOOL_ID@.spool-broker</string>
+	</array>
 	<!-- Factory UUID -> exported factory function (crates/driver/src/lib.rs). -->
 	<key>CFPlugInFactories</key>
 	<dict>

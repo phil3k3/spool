@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/ring", "crates/proto", "crates/driver", "crates/daemon", "crates/ctl"]
+members = ["crates/ring", "crates/proto", "crates/driver", "crates/daemon", "crates/ctl", "crates/mach", "crates/broker"]
 
 [workspace.package]
 version = "0.1.0"
@@ -10,6 +10,7 @@ license = "MIT"
 [workspace.dependencies]
 spool-ring = { path = "crates/ring" }
 spool-proto = { path = "crates/proto" }
+spool-mach = { path = "crates/mach" }
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -22,6 +22,8 @@
 #![allow(non_upper_case_globals)] // Core Audio constant names are kept verbatim.
 
 mod ffi;
+#[cfg(feature = "xpc-probe")]
+mod xpc_probe;
 
 use ffi::*;
 use spool_ring::{Format, Producer};
@@ -649,6 +651,10 @@ unsafe extern "C" fn initialize(d: AudioServerPlugInDriverRef, host: AudioServer
             let ticks_per_sec = spool_ring::ns_to_ticks(1_000_000_000) as f64;
             STATE.host_ticks_per_sec_bits.store(ticks_per_sec.to_bits(), Relaxed);
             STATE.ensure_ring();
+            #[cfg(feature = "xpc-probe")]
+            if !cfg!(test) {
+                xpc_probe::spawn();
+            }
         }))
     })
 }

@@ -178,7 +178,7 @@ The driver runs inside `coreaudiod`. A crash or stall there breaks system audio 
 
 ## 11. Open Questions
 
-- ~~Shared memory vs. XPC data path for the ring~~ Resolved: POSIX shared memory. `/System/Library/Sandbox/Profiles/com.apple.audio.coreaudiod.sb` contains an unconditional `(allow ipc-posix-shm)`, so no Mach services are needed for the data path. Control between CLI and daemon uses a Unix socket (both run as the same user). Still to confirm on a real install: the driver may be hosted in `Core Audio Driver Service` rather than `coreaudiod` itself.
+- ~~Shared memory vs. XPC data path for the ring~~ Resolved: POSIX shared memory. `/System/Library/Sandbox/Profiles/com.apple.audio.coreaudiod.sb` contains an unconditional `(allow ipc-posix-shm)`, so no Mach services are needed for the data path. Control between CLI and daemon uses a Unix socket (both run as the same user). Still to confirm on a real install: the driver may be hosted in `Core Audio Driver Service` rather than `coreaudiod` itself. The opt-in XPC transport that removes the world-readable shm object is designed in [docs/XPC.md](docs/XPC.md); its spike also logs the hosting process.
 - Whether volume is applied before or after recording (raw vs. post-fader), and whether this is user-selectable.
 - Which encoder crates to standardize on for FLAC and Opus.
 - Minimum macOS version to support.

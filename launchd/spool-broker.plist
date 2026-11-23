@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Template: scripts/build-bundle.sh replaces @SPOOL_ID@ (scripts/spool-id.sh). -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>@SPOOL_ID@.spool-broker</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/local/libexec/spool-broker</string>
+	</array>
+	<!-- Launched on demand when the driver or spoold looks the service up. -->
+	<key>MachServices</key>
+	<dict>
+		<key>@SPOOL_ID@.spool-broker</key>
+		<true/>
+	</dict>
+	<!-- Needs no privileges: it only passes Mach ports along. -->
+	<key>UserName</key>
+	<string>nobody</string>
+</dict>
+</plist>
